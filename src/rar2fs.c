@@ -121,6 +121,10 @@ struct io_context {
 #endif
 };
 
+#ifdef HAVE_FUSE_PASSTHROUGH
+struct passthrough_backing;
+#endif
+
 struct io_handle {
         int type;
 #define IO_TYPE_NRM 0
@@ -137,7 +141,7 @@ struct io_handle {
         } u;
         char *path;                             /* type = all */
 #ifdef HAVE_FUSE_PASSTHROUGH
-        int backing_id;                         /* type = IO_TYPE_NRM */
+        struct passthrough_backing *backing;    /* type = IO_TYPE_NRM */
 #endif
 };
 
@@ -182,12 +186,22 @@ static pthread_mutex_t warmup_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t warmup_cond = PTHREAD_COND_INITIALIZER;
 static char *src_path_full = NULL;
 #ifdef HAVE_FUSE_PASSTHROUGH
+struct passthrough_backing {
+        dev_t dev;
+        ino_t ino;
+        int backing_id;
+        unsigned int refs;
+        struct passthrough_backing *next;
+};
+
 static int fuse_dev_fd = -1;
 static int passthrough_enabled = 0;
 static int passthrough_required_unavailable = 0;
 static int passthrough_failure_logged = 0;
+static struct passthrough_backing *passthrough_backings = NULL;
+static pthread_mutex_t passthrough_backing_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t passthrough_log_lock = PTHREAD_MUTEX_INITIALIZER;
-static void lpassthrough_close(int backing_id);
+static void lpassthrough_put(struct passthrough_backing *backing);
 #endif
 
 #define P_ALIGN_(a) (((a)+page_size_)&~(page_size_-1))
@@ -1656,11 +1670,12 @@ static int lrelease(struct fuse_file_info *fi)
         } else {
 #ifdef HAVE_FUSE_PASSTHROUGH
                 if (FH_TOIO(fi->fh)->type == IO_TYPE_NRM &&
-                                FH_TOIO(fi->fh)->backing_id > 0) {
-                        int backing_id = FH_TOIO(fi->fh)->backing_id;
-                        FH_TOIO(fi->fh)->backing_id = 0;
+                                FH_TOIO(fi->fh)->backing) {
+                        struct passthrough_backing *backing =
+                                        FH_TOIO(fi->fh)->backing;
+                        FH_TOIO(fi->fh)->backing = NULL;
                         fi->backing_id = 0;
-                        lpassthrough_close(backing_id);
+                        lpassthrough_put(backing);
                 }
 #endif
                 if (FH_TOFD(fi->fh) >= 0)
@@ -1751,6 +1766,79 @@ static void lpassthrough_close(int backing_id)
                 printd(2, "Failed to close passthrough backing id %d: %s\n",
                        backing_id, strerror(errno));
 }
+
+/* The kernel requires every overlapping passthrough open of the same FUSE
+ * inode to use the same registered backing object.  A new BACKING_OPEN ioctl
+ * creates a distinct object even when its fd refers to the same local file,
+ * so share one backing ID for each backing inode until its last handle is
+ * released. */
+static int lpassthrough_get(int fd, struct passthrough_backing **backing_p)
+{
+        struct passthrough_backing *backing;
+        struct stat st;
+        int backing_id;
+
+        *backing_p = NULL;
+        if (fstat(fd, &st))
+                return -errno;
+
+        pthread_mutex_lock(&passthrough_backing_lock);
+        for (backing = passthrough_backings; backing; backing = backing->next) {
+                if (backing->dev == st.st_dev && backing->ino == st.st_ino) {
+                        backing->refs++;
+                        backing_id = backing->backing_id;
+                        *backing_p = backing;
+                        pthread_mutex_unlock(&passthrough_backing_lock);
+                        return backing_id;
+                }
+        }
+
+        backing = malloc(sizeof(*backing));
+        if (!backing) {
+                pthread_mutex_unlock(&passthrough_backing_lock);
+                return -ENOMEM;
+        }
+
+        backing_id = lpassthrough_open(fd);
+        backing->dev = st.st_dev;
+        backing->ino = st.st_ino;
+        backing->backing_id = backing_id;
+        backing->refs = 1;
+        backing->next = passthrough_backings;
+        passthrough_backings = backing;
+        *backing_p = backing;
+        pthread_mutex_unlock(&passthrough_backing_lock);
+        return backing_id;
+}
+
+static void lpassthrough_put(struct passthrough_backing *backing)
+{
+        struct passthrough_backing **link;
+        int backing_id;
+        int found = 0;
+
+        pthread_mutex_lock(&passthrough_backing_lock);
+        for (link = &passthrough_backings; *link; link = &(*link)->next) {
+                if (*link != backing)
+                        continue;
+                if (--(*link)->refs) {
+                        pthread_mutex_unlock(&passthrough_backing_lock);
+                        return;
+                }
+                *link = backing->next;
+                found = 1;
+                break;
+        }
+        pthread_mutex_unlock(&passthrough_backing_lock);
+
+        if (!found)
+                return;
+
+        backing_id = backing->backing_id;
+        if (backing_id > 0)
+                lpassthrough_close(backing_id);
+        free(backing);
+}
 #endif
 
 /*!
@@ -1777,12 +1865,16 @@ static int lopen_common(const char *path, struct fuse_file_info *fi,
 #ifdef HAVE_FUSE_PASSTHROUGH
         fi->backing_id = 0;
         if (passthrough_enabled) {
-                int backing_id = lpassthrough_open(fd);
+                struct passthrough_backing *backing;
+                int backing_id = lpassthrough_get(fd, &backing);
                 if (backing_id < 0) {
-                        if (rar2fs_mount_opts.passthrough == PASSTHROUGH_FORCE) {
+                        if (!backing || rar2fs_mount_opts.passthrough ==
+                                        PASSTHROUGH_FORCE) {
                                 syslog(LOG_ERR, "cannot enable passthrough for "
                                        "%s: %s", path,
                                        lpassthrough_error(-backing_id));
+                                if (backing)
+                                        lpassthrough_put(backing);
                                 close(fd);
                                 if (create)
                                         unlink(path);
@@ -1791,7 +1883,6 @@ static int lopen_common(const char *path, struct fuse_file_info *fi,
                         }
                         lpassthrough_warn_once(path, -backing_id);
                 } else {
-                        io->backing_id = backing_id;
                         fi->backing_id = backing_id;
                         /* FOPEN_DIRECT_IO takes precedence over
                          * FOPEN_PASSTHROUGH for read/write requests. */
@@ -1799,6 +1890,7 @@ static int lopen_common(const char *path, struct fuse_file_info *fi,
                         syslog(LOG_DEBUG, "passthrough backing id %d for %s",
                                backing_id, path);
                 }
+                io->backing = backing;
         }
 #endif
 

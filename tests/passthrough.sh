@@ -34,6 +34,7 @@ pid=
 
 cleanup()
 {
+        exec 3<&-
         if mountpoint -q "$mnt" 2>/dev/null; then
                 fusermount3 -u "$mnt" >/dev/null 2>&1 || true
         fi
@@ -73,13 +74,25 @@ done
 # Read a local file through cp.  A registered passthrough handle must keep the
 # READ request in the kernel instead of dispatching it to the rar2fs daemon.
 log_offset=$(( $(wc -c <"$log") + 1 ))
+# Keep one handle open while cp opens the same FUSE inode again.  Both opens
+# must share one backing ID; registering a second backing object makes the
+# kernel reject the overlapping open with EIO.
+exec 3<"$mnt/local.bin" || exit 1
 cp "$mnt/local.bin" "$tmp/local-copy.bin" || exit 1
 cmp "$src/local.bin" "$tmp/local-copy.bin" || exit 1
+exec 3<&-
 sleep 1
 tail -c +"$log_offset" "$log" >"$local_log"
 if ! grep -Eq 'passthrough backing id [1-9][0-9]* for .*local\.bin' \
                 "$local_log"; then
         echo "local file was not registered as a passthrough backing file" >&2
+        cat "$local_log" >&2
+        exit 1
+fi
+backing_ids=$(sed -n 's/.*passthrough backing id \([1-9][0-9]*\) for .*local\.bin.*/\1/p' \
+                      "$local_log" | sort -u | wc -l)
+if test "$backing_ids" -ne 1; then
+        echo "overlapping opens did not share one passthrough backing ID" >&2
         cat "$local_log" >&2
         exit 1
 fi

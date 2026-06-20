@@ -41,7 +41,7 @@
 # include <fuse_lowlevel.h>
 # if defined(__linux__) && defined(FUSE_CAP_PASSTHROUGH)
 #  include <sys/ioctl.h>
-#  include <fuse_kernel.h>
+#  include <linux/fuse.h>
 #  if defined(FUSE_DEV_IOC_BACKING_OPEN) && \
                 defined(FUSE_DEV_IOC_BACKING_CLOSE)
 #   define HAVE_FUSE_PASSTHROUGH 1

@@ -41,10 +41,14 @@
 # include <fuse_lowlevel.h>
 # if defined(__linux__) && defined(FUSE_CAP_PASSTHROUGH)
 #  include <sys/ioctl.h>
+#  include <sys/vfs.h>
 #  include <linux/fuse.h>
 #  if defined(FUSE_DEV_IOC_BACKING_OPEN) && \
                 defined(FUSE_DEV_IOC_BACKING_CLOSE)
 #   define HAVE_FUSE_PASSTHROUGH 1
+#  endif
+#  ifndef FUSE_SUPER_MAGIC
+#   define FUSE_SUPER_MAGIC 0x65735546UL
 #  endif
 # endif
 #endif
@@ -1764,22 +1768,35 @@ static int lopen(const char *path, struct fuse_file_info *fi)
 #ifdef HAVE_FUSE_PASSTHROUGH
         fi->backing_id = 0;
         if (passthrough_enabled) {
-                int backing_id = lpassthrough_open(fd);
-                if (backing_id < 0) {
-                        if (rar2fs_mount_opts.passthrough == PASSTHROUGH_FORCE) {
-                                syslog(LOG_ERR, "cannot enable passthrough for "
-                                       "%s: %s", path,
-                                       strerror(-backing_id));
-                                close(fd);
-                                free(io);
-                                return backing_id;
-                        }
-                        lpassthrough_warn_once(path, -backing_id);
+                /* Skip passthrough when the backing file itself lives on a
+                 * FUSE filesystem (e.g. MergerFS).  The kernel rejects such
+                 * registrations at open-reply time with EIO because the FUSE
+                 * passthrough layer cannot chain another non-passthrough FUSE
+                 * mount as a backing store. */
+                struct statfs sfs;
+                int on_fuse = (fstatfs(fd, &sfs) == 0 &&
+                               sfs.f_type == (long)FUSE_SUPER_MAGIC);
+                if (on_fuse) {
+                        syslog(LOG_DEBUG, "skipping passthrough for FUSE-backed "
+                               "file %s", path);
                 } else {
-                        io->backing_id = backing_id;
-                        fi->backing_id = backing_id;
-                        syslog(LOG_DEBUG, "passthrough backing id %d for %s",
-                               backing_id, path);
+                        int backing_id = lpassthrough_open(fd);
+                        if (backing_id < 0) {
+                                if (rar2fs_mount_opts.passthrough == PASSTHROUGH_FORCE) {
+                                        syslog(LOG_ERR, "cannot enable passthrough for "
+                                               "%s: %s", path,
+                                               strerror(-backing_id));
+                                        close(fd);
+                                        free(io);
+                                        return backing_id;
+                                }
+                                lpassthrough_warn_once(path, -backing_id);
+                        } else {
+                                io->backing_id = backing_id;
+                                fi->backing_id = backing_id;
+                                syslog(LOG_DEBUG, "passthrough backing id %d for %s",
+                                       backing_id, path);
+                        }
                 }
         }
 #endif

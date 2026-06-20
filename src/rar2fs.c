@@ -185,6 +185,8 @@ static char *src_path_full = NULL;
 static int fuse_dev_fd = -1;
 static int passthrough_enabled = 0;
 static int passthrough_required_unavailable = 0;
+static int passthrough_failure_logged = 0;
+static pthread_mutex_t passthrough_log_lock = PTHREAD_MUTEX_INITIALIZER;
 static void lpassthrough_close(int backing_id);
 #endif
 
@@ -1720,6 +1722,18 @@ static int lpassthrough_open(int fd)
         return backing_id;
 }
 
+static void lpassthrough_warn_once(const char *path, int err)
+{
+        pthread_mutex_lock(&passthrough_log_lock);
+        if (!passthrough_failure_logged) {
+                syslog(LOG_WARNING, "passthrough unavailable for local file "
+                       "%s: cannot register backing file: %s",
+                       path, strerror(err));
+                passthrough_failure_logged = 1;
+        }
+        pthread_mutex_unlock(&passthrough_log_lock);
+}
+
 static void lpassthrough_close(int backing_id)
 {
         uint32_t id = backing_id;
@@ -1753,15 +1767,19 @@ static int lopen(const char *path, struct fuse_file_info *fi)
                 int backing_id = lpassthrough_open(fd);
                 if (backing_id < 0) {
                         if (rar2fs_mount_opts.passthrough == PASSTHROUGH_FORCE) {
+                                syslog(LOG_ERR, "cannot enable passthrough for "
+                                       "%s: %s", path,
+                                       strerror(-backing_id));
                                 close(fd);
                                 free(io);
                                 return backing_id;
                         }
-                        printd(2, "Passthrough unavailable for %s: %s\n",
-                               path, error_to_string(-backing_id));
+                        lpassthrough_warn_once(path, -backing_id);
                 } else {
                         io->backing_id = backing_id;
                         fi->backing_id = backing_id;
+                        syslog(LOG_DEBUG, "passthrough backing id %d for %s",
+                               backing_id, path);
                 }
         }
 #endif
@@ -4533,13 +4551,26 @@ static void *rar2_init_common(struct fuse_conn_info *conn)
         fuse_unset_feature_flag(conn, FUSE_CAP_PASSTHROUGH);
         if (rar2fs_mount_opts.passthrough != PASSTHROUGH_OFF) {
                 if (fuse_set_feature_flag(conn, FUSE_CAP_PASSTHROUGH)) {
+                        /* Permit a local backing file to reside on one stacked
+                         * filesystem (for example overlayfs or another FUSE
+                         * passthrough mount).  Libfuse's default of zero makes
+                         * those backing registrations fail with ELOOP. */
+                        conn->max_backing_stack_depth =
+                                        FUSE_BACKING_STACKED_OVER;
                         passthrough_enabled = 1;
+                        syslog(LOG_INFO, "FUSE passthrough enabled "
+                               "(max backing stack depth %u)",
+                               conn->max_backing_stack_depth);
                 } else if (rar2fs_mount_opts.passthrough ==
                                 PASSTHROUGH_FORCE) {
-                        fprintf(stderr, "rar2fs: FUSE passthrough is not "
-                                        "supported by this kernel\n");
+                        syslog(LOG_ERR, "FUSE passthrough is not supported "
+                               "by this kernel");
                         passthrough_required_unavailable = 1;
                         fuse_exit(fuse_get_context()->fuse);
+                } else {
+                        syslog(LOG_WARNING, "FUSE passthrough unavailable: "
+                               "the kernel did not advertise support; "
+                               "using normal FUSE I/O");
                 }
         }
 #else
@@ -5527,6 +5558,7 @@ static void *work_task(void *data)
  *****************************************************************************
  *
  ****************************************************************************/
+#if FUSE_MAJOR_VERSION == 2
 static void scan_fuse_new_args(struct fuse_args *args)
 {
         const char *match_w_arg = "subtype=rar2fs";
@@ -5595,6 +5627,7 @@ static void release_stdio()
                 stderr_ = 0;
         }
 }
+#endif
 
 /*!
  *****************************************************************************
@@ -5809,6 +5842,11 @@ static void print_version()
         printf("This program comes with ABSOLUTELY NO WARRANTY.\n"
                "This is free software, and you are welcome to redistribute it under\n"
                "certain conditions; see <http://www.gnu.org/licenses/> for details.\n");
+#ifdef HAVE_FUSE_PASSTHROUGH
+        printf("FUSE passthrough support: compiled in\n");
+#else
+        printf("FUSE passthrough support: unavailable at build time\n");
+#endif
 }
 
 /*!

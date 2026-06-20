@@ -27,6 +27,8 @@ src=$tmp/source
 archive_src=$tmp/archive-source
 mnt=$tmp/mount
 log=$tmp/rar2fs.log
+local_log=$tmp/local.log
+archive_log=$tmp/archive.log
 pid=
 
 cleanup()
@@ -43,11 +45,11 @@ cleanup()
 trap cleanup EXIT HUP INT TERM
 
 mkdir -p "$src" "$archive_src" "$mnt"
-printf '%s\n' local-before >"$src/local.txt"
+dd if=/dev/urandom of="$src/local.bin" bs=1M count=2 >/dev/null 2>&1 || exit 1
 printf '%s\n' archive-data >"$archive_src/archived.txt"
 (cd "$archive_src" && "$RAR" a -idq "$src/content.rar" archived.txt) || exit 1
 
-"$RAR2FS" "$src" "$mnt" -f -o passthrough=force >"$log" 2>&1 &
+"$RAR2FS" "$src" "$mnt" -f -d -o passthrough=force >"$log" 2>&1 &
 pid=$!
 
 i=0
@@ -64,13 +66,36 @@ while ! mountpoint -q "$mnt" 2>/dev/null; do
         sleep 0.1
 done
 
-printf '%s\n' local-before | cmp - "$mnt/local.txt" || exit 1
-printf '%s\n' local-after >"$mnt/local.txt" || exit 1
-printf '%s\n' local-after | cmp - "$src/local.txt" || exit 1
+# Read a local file through cp.  A registered passthrough handle must keep the
+# READ request in the kernel instead of dispatching it to the rar2fs daemon.
+log_offset=$(( $(wc -c <"$log") + 1 ))
+cp "$mnt/local.bin" "$tmp/local-copy.bin" || exit 1
+cmp "$src/local.bin" "$tmp/local-copy.bin" || exit 1
+sleep 1
+tail -c +"$log_offset" "$log" >"$local_log"
+if ! grep -Eq 'passthrough backing id [1-9][0-9]* for .*local\.bin' \
+                "$local_log"; then
+        echo "local file was not registered as a passthrough backing file" >&2
+        cat "$local_log" >&2
+        exit 1
+fi
+if grep -q 'opcode: READ ' "$local_log"; then
+        echo "local-file copy reached the FUSE read callback" >&2
+        cat "$local_log" >&2
+        exit 1
+fi
 
 # There is no local archived.txt in the source tree.  A successful read here
 # therefore verifies that force mode does not try to register archive handles
 # as passthrough backing files.
+log_offset=$(( $(wc -c <"$log") + 1 ))
 printf '%s\n' archive-data | cmp - "$mnt/archived.txt" || exit 1
+sleep 1
+tail -c +"$log_offset" "$log" >"$archive_log"
+if ! grep -q 'opcode: READ ' "$archive_log"; then
+        echo "archive read unexpectedly bypassed the FUSE read callback" >&2
+        cat "$archive_log" >&2
+        exit 1
+fi
 
 exit 0

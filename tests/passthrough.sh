@@ -50,7 +50,10 @@ dd if=/dev/urandom of="$src/local.bin" bs=1M count=2 >/dev/null 2>&1 || exit 1
 printf '%s\n' archive-data >"$archive_src/archived.txt"
 (cd "$archive_src" && "$RAR" a -idq "$src/content.rar" archived.txt) || exit 1
 
-"$RAR2FS" "$src" "$mnt" -f -d -o passthrough=force >"$log" 2>&1 &
+# Deliberately include direct_io: rar2fs must suppress the global libfuse flag
+# after negotiating passthrough, because the kernel gives FOPEN_DIRECT_IO
+# precedence over FOPEN_PASSTHROUGH for reads and writes.
+"$RAR2FS" "$src" "$mnt" -f -d -o passthrough=force,direct_io >"$log" 2>&1 &
 pid=$!
 
 i=0

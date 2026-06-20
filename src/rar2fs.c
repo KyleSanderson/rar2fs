@@ -1793,6 +1793,9 @@ static int lopen_common(const char *path, struct fuse_file_info *fi,
                 } else {
                         io->backing_id = backing_id;
                         fi->backing_id = backing_id;
+                        /* FOPEN_DIRECT_IO takes precedence over
+                         * FOPEN_PASSTHROUGH for read/write requests. */
+                        fi->direct_io = 0;
                         syslog(LOG_DEBUG, "passthrough backing id %d for %s",
                                backing_id, path);
                 }
@@ -4610,7 +4613,8 @@ static void *rar2_init_common(struct fuse_conn_info *conn)
                                         FUSE_BACKING_STACKED_OVER;
                         passthrough_enabled = 1;
                         syslog(LOG_INFO, "FUSE passthrough enabled "
-                               "(backing stack depth %u, FUSE stack depth %u)",
+                               "(stacking=OVER, backing max depth %u, "
+                               "FUSE depth %u)",
                                conn->max_backing_stack_depth,
                                conn->max_backing_stack_depth + 1);
                 } else if (rar2fs_mount_opts.passthrough ==
@@ -4642,8 +4646,22 @@ static void *rar2_init_common(struct fuse_conn_info *conn)
 #if FUSE_MAJOR_VERSION >= 3
 static void *rar2_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
 {
+        void *data = rar2_init_common(conn);
+
+#ifdef HAVE_FUSE_PASSTHROUGH
+        /* The high-level libfuse path applies cfg->direct_io after open() has
+         * returned, overriding the per-file value above.  If left set, the
+         * OPEN reply contains both FOPEN_DIRECT_IO and FOPEN_PASSTHROUGH and
+         * the kernel routes read/write requests back to the daemon. */
+        if (passthrough_enabled && cfg->direct_io) {
+                cfg->direct_io = 0;
+                syslog(LOG_WARNING, "ignoring direct_io mount option because "
+                       "it overrides FUSE passthrough");
+        }
+#else
         (void)cfg;
-        return rar2_init_common(conn);
+#endif
+        return data;
 }
 #else
 static void *rar2_init(struct fuse_conn_info *conn)

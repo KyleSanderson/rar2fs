@@ -41,14 +41,10 @@
 # include <fuse_lowlevel.h>
 # if defined(__linux__) && defined(FUSE_CAP_PASSTHROUGH)
 #  include <sys/ioctl.h>
-#  include <sys/vfs.h>
 #  include <linux/fuse.h>
 #  if defined(FUSE_DEV_IOC_BACKING_OPEN) && \
                 defined(FUSE_DEV_IOC_BACKING_CLOSE)
 #   define HAVE_FUSE_PASSTHROUGH 1
-#  endif
-#  ifndef FUSE_SUPER_MAGIC
-#   define FUSE_SUPER_MAGIC 0x65735546UL
 #  endif
 # endif
 #endif
@@ -1726,13 +1722,21 @@ static int lpassthrough_open(int fd)
         return backing_id;
 }
 
+static const char *lpassthrough_error(int err)
+{
+        if (err == ELOOP)
+                return "backing filesystem stack is already at the kernel "
+                       "maximum depth";
+        return strerror(err);
+}
+
 static void lpassthrough_warn_once(const char *path, int err)
 {
         pthread_mutex_lock(&passthrough_log_lock);
         if (!passthrough_failure_logged) {
                 syslog(LOG_WARNING, "passthrough unavailable for local file "
                        "%s: cannot register backing file: %s",
-                       path, strerror(err));
+                       path, lpassthrough_error(err));
                 passthrough_failure_logged = 1;
         }
         pthread_mutex_unlock(&passthrough_log_lock);
@@ -1753,13 +1757,18 @@ static void lpassthrough_close(int backing_id)
  *****************************************************************************
  *
  ****************************************************************************/
-static int lopen(const char *path, struct fuse_file_info *fi)
+static int lopen_common(const char *path, struct fuse_file_info *fi,
+                mode_t mode, int create)
 {
         ENTER_("%s", path);
         struct io_handle *io = calloc(1, sizeof(struct io_handle));
         if (!io)
                 return -ENOMEM;
-        int fd = open(path, fi->flags);
+        int fd;
+        if (create)
+                fd = open(path, fi->flags | O_CREAT, mode);
+        else
+                fd = open(path, fi->flags);
         if (fd == -1) {
                 free(io);
                 return -errno;
@@ -1768,35 +1777,24 @@ static int lopen(const char *path, struct fuse_file_info *fi)
 #ifdef HAVE_FUSE_PASSTHROUGH
         fi->backing_id = 0;
         if (passthrough_enabled) {
-                /* Skip passthrough when the backing file itself lives on a
-                 * FUSE filesystem (e.g. MergerFS).  The kernel rejects such
-                 * registrations at open-reply time with EIO because the FUSE
-                 * passthrough layer cannot chain another non-passthrough FUSE
-                 * mount as a backing store. */
-                struct statfs sfs;
-                int on_fuse = (fstatfs(fd, &sfs) == 0 &&
-                               sfs.f_type == (long)FUSE_SUPER_MAGIC);
-                if (on_fuse) {
-                        syslog(LOG_DEBUG, "skipping passthrough for FUSE-backed "
-                               "file %s", path);
-                } else {
-                        int backing_id = lpassthrough_open(fd);
-                        if (backing_id < 0) {
-                                if (rar2fs_mount_opts.passthrough == PASSTHROUGH_FORCE) {
-                                        syslog(LOG_ERR, "cannot enable passthrough for "
-                                               "%s: %s", path,
-                                               strerror(-backing_id));
-                                        close(fd);
-                                        free(io);
-                                        return backing_id;
-                                }
-                                lpassthrough_warn_once(path, -backing_id);
-                        } else {
-                                io->backing_id = backing_id;
-                                fi->backing_id = backing_id;
-                                syslog(LOG_DEBUG, "passthrough backing id %d for %s",
-                                       backing_id, path);
+                int backing_id = lpassthrough_open(fd);
+                if (backing_id < 0) {
+                        if (rar2fs_mount_opts.passthrough == PASSTHROUGH_FORCE) {
+                                syslog(LOG_ERR, "cannot enable passthrough for "
+                                       "%s: %s", path,
+                                       lpassthrough_error(-backing_id));
+                                close(fd);
+                                if (create)
+                                        unlink(path);
+                                free(io);
+                                return backing_id;
                         }
+                        lpassthrough_warn_once(path, -backing_id);
+                } else {
+                        io->backing_id = backing_id;
+                        fi->backing_id = backing_id;
+                        syslog(LOG_DEBUG, "passthrough backing id %d for %s",
+                               backing_id, path);
                 }
         }
 #endif
@@ -1806,6 +1804,18 @@ static int lopen(const char *path, struct fuse_file_info *fi)
         FH_SETFD(fi->fh, fd);
         return 0;
 }
+
+static int lopen(const char *path, struct fuse_file_info *fi)
+{
+        return lopen_common(path, fi, 0, 0);
+}
+
+#ifdef HAVE_FUSE_PASSTHROUGH
+static int lcreate(const char *path, mode_t mode, struct fuse_file_info *fi)
+{
+        return lopen_common(path, fi, mode, 1);
+}
+#endif
 
 /*!
  *****************************************************************************
@@ -4356,6 +4366,27 @@ static inline int access_chk(const char *path, int new_file)
         return e && !e->flags.unresolved ? 1 : 0;
 }
 
+#ifdef HAVE_FUSE_PASSTHROUGH
+/* Handle FUSE_CREATE directly so libfuse returns FOPEN_PASSTHROUGH and the
+ * backing ID in the same CREATE reply. */
+static int rar2_create(const char *path, mode_t mode,
+                struct fuse_file_info *fi)
+{
+        char *root;
+        int res;
+
+        ENTER_("%s", path);
+        if (access_chk(path, 1))
+                return -EPERM;
+
+        ABS_ROOT(root, path);
+        res = lcreate(root, mode, fi);
+        if (!res)
+                __dircache_invalidate_for_file(path);
+        return res;
+}
+#endif
+
 /*!
  *****************************************************************************
  *
@@ -4567,6 +4598,9 @@ static void *rar2_init_common(struct fuse_conn_info *conn)
         passthrough_required_unavailable = 0;
         fuse_unset_feature_flag(conn, FUSE_CAP_PASSTHROUGH);
         if (rar2fs_mount_opts.passthrough != PASSTHROUGH_OFF) {
+                /* The kernel refuses the FUSE_PASSTHROUGH and
+                 * FUSE_WRITEBACK_CACHE combination during INIT. */
+                fuse_unset_feature_flag(conn, FUSE_CAP_WRITEBACK_CACHE);
                 if (fuse_set_feature_flag(conn, FUSE_CAP_PASSTHROUGH)) {
                         /* Permit a local backing file to reside on one stacked
                          * filesystem (for example overlayfs or another FUSE
@@ -4576,8 +4610,9 @@ static void *rar2_init_common(struct fuse_conn_info *conn)
                                         FUSE_BACKING_STACKED_OVER;
                         passthrough_enabled = 1;
                         syslog(LOG_INFO, "FUSE passthrough enabled "
-                               "(max backing stack depth %u)",
-                               conn->max_backing_stack_depth);
+                               "(backing stack depth %u, FUSE stack depth %u)",
+                               conn->max_backing_stack_depth,
+                               conn->max_backing_stack_depth + 1);
                 } else if (rar2fs_mount_opts.passthrough ==
                                 PASSTHROUGH_FORCE) {
                         syslog(LOG_ERR, "FUSE passthrough is not supported "
@@ -5677,6 +5712,9 @@ static int work(struct fuse_args *args)
                 rar2_operations.opendir         = rar2_opendir;
                 rar2_operations.readdir         = rar2_readdir;
                 rar2_operations.releasedir      = rar2_releasedir;
+#ifdef HAVE_FUSE_PASSTHROUGH
+                rar2_operations.create          = rar2_create;
+#endif
                 rar2_operations.rename          = rar2_rename;
                 rar2_operations.mknod           = rar2_mknod;
                 rar2_operations.unlink          = rar2_unlink;

@@ -28,6 +28,7 @@ archive_src=$tmp/archive-source
 mnt=$tmp/mount
 log=$tmp/rar2fs.log
 local_log=$tmp/local.log
+create_log=$tmp/create.log
 archive_log=$tmp/archive.log
 pid=
 
@@ -82,6 +83,25 @@ fi
 if grep -q 'opcode: READ ' "$local_log"; then
         echo "local-file copy reached the FUSE read callback" >&2
         cat "$local_log" >&2
+        exit 1
+fi
+
+# A newly created local file must return its backing ID as part of the CREATE
+# reply.  Its payload writes must likewise stay out of the rar2fs daemon.
+log_offset=$(( $(wc -c <"$log") + 1 ))
+cp "$src/local.bin" "$mnt/created.bin" || exit 1
+cmp "$src/local.bin" "$src/created.bin" || exit 1
+sleep 1
+tail -c +"$log_offset" "$log" >"$create_log"
+if ! grep -Eq 'passthrough backing id [1-9][0-9]* for .*created\.bin' \
+                "$create_log"; then
+        echo "created file was not registered as a passthrough backing file" >&2
+        cat "$create_log" >&2
+        exit 1
+fi
+if grep -q 'opcode: WRITE ' "$create_log"; then
+        echo "created-file copy reached the FUSE write callback" >&2
+        cat "$create_log" >&2
         exit 1
 fi
 

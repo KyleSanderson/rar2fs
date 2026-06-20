@@ -4702,7 +4702,7 @@ static void *rar2_init_common(struct fuse_conn_info *conn)
                          * passthrough mount).  Libfuse's default of zero makes
                          * those backing registrations fail with ELOOP. */
                         conn->max_backing_stack_depth =
-                                        2;
+                                        FUSE_BACKING_STACKED_OVER;
                         passthrough_enabled = 1;
                         syslog(LOG_INFO, "FUSE passthrough enabled "
                                "(stacking=OVER, backing max depth %u, "

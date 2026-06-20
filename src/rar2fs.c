@@ -4520,6 +4520,13 @@ static void *rar2_init_common(struct fuse_conn_info *conn)
 
         pthread_t t;
 
+#if FUSE_MAJOR_VERSION >= 3
+        /* The libfuse3 high-level fuse_new path does not consume sync_read.
+         * Preserve rar2fs's existing synchronous-read behavior through the
+         * connection capability API instead. */
+        fuse_unset_feature_flag(conn, FUSE_CAP_ASYNC_READ);
+#endif
+
 #ifdef HAVE_FUSE_PASSTHROUGH
         passthrough_enabled = 0;
         passthrough_required_unavailable = 0;
@@ -5693,16 +5700,8 @@ static int work(struct fuse_args *args)
                 mt = !opts.singlethread;
                 fg = opts.foreground;
 
-                /* Avoid any output from the initial attempt. */
-                block_stdio();
                 f = fuse_new(args, &rar2_operations,
                              sizeof(rar2_operations), NULL);
-                release_stdio();
-                if (f == NULL) {
-                        (void)scan_fuse_new_args(args);
-                        f = fuse_new(args, &rar2_operations,
-                                     sizeof(rar2_operations), NULL);
-                }
                 if (f != NULL && fuse_mount(f, mp)) {
                         fuse_destroy(f);
                         f = NULL;
@@ -6045,7 +6044,11 @@ int main(int argc, char *argv[])
                         return -1;
         }
 
+#if FUSE_MAJOR_VERSION >= 3
+        fuse_opt_add_arg(&args, "-ofsname=rar2fs,subtype=rar2fs");
+#else
         fuse_opt_add_arg(&args, "-osync_read,fsname=rar2fs,subtype=rar2fs");
+#endif
         if (OPT_SET(OPT_KEY_DST))
                 fuse_opt_add_arg(&args, OPT_STR(OPT_KEY_DST, 0));
 
